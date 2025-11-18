@@ -1,149 +1,214 @@
-// socket.js - Socket.io client setup
+// src/socket.js
+import { io } from "socket.io-client";
+import { useEffect, useState, useRef, useCallback } from "react";
 
-import { io } from 'socket.io-client';
-import { useEffect, useState } from 'react';
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
 
-// Socket.io connection URL
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000';
-
-// Create socket instance
 export const socket = io(SOCKET_URL, {
   autoConnect: false,
   reconnection: true,
-  reconnectionAttempts: 5,
+  reconnectionAttempts: Infinity,
   reconnectionDelay: 1000,
+  transports: ["websocket", "polling"],
 });
 
-// Custom hook for using socket.io
 export const useSocket = () => {
   const [isConnected, setIsConnected] = useState(socket.connected);
-  const [lastMessage, setLastMessage] = useState(null);
-  const [messages, setMessages] = useState([]);
-  const [users, setUsers] = useState([]);
-  const [typingUsers, setTypingUsers] = useState([]);
+  const [messages, setMessages] = useState([]); // current room messages
+  const [users, setUsers] = useState([]); // online users array {id, username}
+  const [typingUsers, setTypingUsers] = useState([]); // usernames typing in room
+  const [currentRoom, setCurrentRoom] = useState("global");
+  const [rooms, setRooms] = useState(["global"]);
+  const [unreadCounts, setUnreadCounts] = useState({}); // { roomId: count }
+  const audioRef = useRef(null);
 
-  // Connect to socket server
+  useEffect(() => {
+    audioRef.current = new Audio("/ding.mp3"); // place ding.mp3 in public/
+  }, []);
+
+  // helpers
+  const playSound = useCallback(() => {
+    try { audioRef.current?.play(); } catch (e) {}
+  }, []);
+
+  const requestNotifPermission = useCallback(() => {
+    if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
+  }, []);
+
+  useEffect(() => {
+    const onConnect = () => setIsConnected(true);
+    const onDisconnect = () => setIsConnected(false);
+
+    const onReceiveMessage = (msg) => {
+      // if message's room matches currentRoom (including DMs), append else increase unread
+      const roomKey = msg.roomId || "global";
+      setMessages((prev) => {
+        // if it's for current room => append and play sound/notify
+        if (roomKey === currentRoom || (roomKey.startsWith("dm:") && currentRoom === roomKey)) {
+          const next = [...prev, msg];
+          playSound();
+          // browser notification
+          if ("Notification" in window && Notification.permission === "granted" && msg.sender !== (localStorage.getItem("username") || null)) {
+            new Notification(`${msg.sender}`, { body: msg.message, icon: "/favicon.ico" });
+          }
+          return next;
+        } else {
+          // bump unread
+          setUnreadCounts((u) => ({ ...u, [roomKey]: (u[roomKey] || 0) + 1 }));
+          return prev;
+        }
+      });
+    };
+
+    const onUserList = (list) => setUsers(list);
+
+    const onUserJoined = (data) => {
+      setMessages((prev) => [...prev, { id: `sys-${Date.now()}`, system: true, message: `${data.username} joined`, timestamp: new Date().toISOString() }]);
+    };
+
+    const onUserLeft = (data) => {
+      setMessages((prev) => [...prev, { id: `sys-${Date.now()}`, system: true, message: `${data.username} left`, timestamp: new Date().toISOString() }]);
+    };
+
+    const onTypingUsers = ({ username, isTyping, roomId }) => {
+      if (roomId !== currentRoom) return;
+      setTypingUsers((prev) => {
+        if (isTyping) {
+          return prev.includes(username) ? prev : [...prev, username];
+        } else {
+          return prev.filter((u) => u !== username);
+        }
+      });
+    };
+
+    const onMessageUpdated = (msg) => {
+      setMessages((prev) => prev.map((m) => (m.id === msg.id ? msg : m)));
+    };
+
+    const onRoomMessages = ({ roomId, messages: hist }) => {
+      if (roomId === currentRoom) setMessages(hist);
+    };
+
+    const onRoomList = (list) => setRooms(list);
+
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
+    socket.on("receive_message", onReceiveMessage);
+    socket.on("user_list", onUserList);
+    socket.on("user_joined", onUserJoined);
+    socket.on("user_left", onUserLeft);
+    socket.on("typing_users", onTypingUsers);
+    socket.on("message_updated", onMessageUpdated);
+    socket.on("room_messages", onRoomMessages);
+    socket.on("room_list", (list) => setRooms(list));
+
+    return () => {
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
+      socket.off("receive_message", onReceiveMessage);
+      socket.off("user_list", onUserList);
+      socket.off("user_joined", onUserJoined);
+      socket.off("user_left", onUserLeft);
+      socket.off("typing_users", onTypingUsers);
+      socket.off("message_updated", onMessageUpdated);
+      socket.off("room_messages", onRoomMessages);
+      socket.off("room_list", (list) => setRooms(list));
+    };
+  }, [currentRoom, playSound]);
+
+  // connect
   const connect = (username) => {
+    if (!username) return;
+    localStorage.setItem("username", username);
+    socket.auth = { username };
     socket.connect();
-    if (username) {
-      socket.emit('user_join', username);
-    }
+    socket.emit("user_join", username, (res) => {
+      // join default
+      joinRoom("global");
+      requestNotifPermission();
+    });
   };
 
-  // Disconnect from socket server
   const disconnect = () => {
     socket.disconnect();
   };
 
-  // Send a message
-  const sendMessage = (message) => {
-    socket.emit('send_message', { message });
+  const joinRoom = (roomId) => {
+    socket.emit("join_room", roomId, (res) => {
+      if (res?.ok) {
+        setCurrentRoom(roomId);
+        setUnreadCounts((u) => ({ ...u, [roomId]: 0 }));
+      }
+    });
   };
 
-  // Send a private message
-  const sendPrivateMessage = (to, message) => {
-    socket.emit('private_message', { to, message });
+  // send message (room or private)
+  const sendMessage = (text, { attachments = [], toSocketId = null } = {}) => {
+    const sender = localStorage.getItem("username") || "Anonymous";
+    const payload = {
+      message: text,
+      sender,
+      roomId: currentRoom,
+      toSocketId,
+      attachments,
+    };
+    socket.emit("send_message", payload, (ack) => {
+      if (ack?.ok) {
+        // optimistic UI: message will arrive via receive_message;
+      }
+    });
   };
 
-  // Set typing status
   const setTyping = (isTyping) => {
-    socket.emit('typing', isTyping);
+    socket.emit("typing", { isTyping, roomId: currentRoom });
   };
 
-  // Socket event listeners
-  useEffect(() => {
-    // Connection events
-    const onConnect = () => {
-      setIsConnected(true);
-    };
+  const markDelivered = (messageId) => {
+    socket.emit("message_delivered", { messageId, roomId: currentRoom });
+  };
 
-    const onDisconnect = () => {
-      setIsConnected(false);
-    };
+  const markRead = (messageId) => {
+    socket.emit("message_read", { messageId, roomId: currentRoom });
+  };
 
-    // Message events
-    const onReceiveMessage = (message) => {
-      setLastMessage(message);
-      setMessages((prev) => [...prev, message]);
-    };
+  const addReaction = (messageId, reaction) => {
+    socket.emit("add_reaction", { messageId, roomId: currentRoom, reaction });
+  };
 
-    const onPrivateMessage = (message) => {
-      setLastMessage(message);
-      setMessages((prev) => [...prev, message]);
-    };
+  const searchMessages = (q) => {
+    return new Promise((resolve) => {
+      socket.emit("search_messages", { roomId: currentRoom, q }, ({ results }) => resolve(results || []));
+    });
+  };
 
-    // User events
-    const onUserList = (userList) => {
-      setUsers(userList);
-    };
-
-    const onUserJoined = (user) => {
-      // You could add a system message here
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now(),
-          system: true,
-          message: `${user.username} joined the chat`,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
-    };
-
-    const onUserLeft = (user) => {
-      // You could add a system message here
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now(),
-          system: true,
-          message: `${user.username} left the chat`,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
-    };
-
-    // Typing events
-    const onTypingUsers = (users) => {
-      setTypingUsers(users);
-    };
-
-    // Register event listeners
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-    socket.on('receive_message', onReceiveMessage);
-    socket.on('private_message', onPrivateMessage);
-    socket.on('user_list', onUserList);
-    socket.on('user_joined', onUserJoined);
-    socket.on('user_left', onUserLeft);
-    socket.on('typing_users', onTypingUsers);
-
-    // Clean up event listeners
-    return () => {
-      socket.off('connect', onConnect);
-      socket.off('disconnect', onDisconnect);
-      socket.off('receive_message', onReceiveMessage);
-      socket.off('private_message', onPrivateMessage);
-      socket.off('user_list', onUserList);
-      socket.off('user_joined', onUserJoined);
-      socket.off('user_left', onUserLeft);
-      socket.off('typing_users', onTypingUsers);
-    };
-  }, []);
+  const loadOlderMessages = async () => {
+    // demo: server stores limited history and emits them on join. For a real app implement REST pagination.
+    // Here we simply request room messages again
+    socket.emit("request_room_history", { roomId: currentRoom }, (res) => {
+      if (res?.messages) {
+        setMessages((prev) => [...res.messages, ...prev]);
+      }
+    });
+  };
 
   return {
     socket,
     isConnected,
-    lastMessage,
     messages,
     users,
     typingUsers,
+    currentRoom,
+    rooms,
+    unreadCounts,
     connect,
     disconnect,
+    joinRoom,
     sendMessage,
-    sendPrivateMessage,
     setTyping,
+    markDelivered,
+    markRead,
+    addReaction,
+    searchMessages,
+    loadOlderMessages,
   };
 };
-
-export default socket; 
